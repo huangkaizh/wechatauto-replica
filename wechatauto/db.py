@@ -503,6 +503,7 @@ class WeChatDB:
         workdir: Optional[str] = None,
         account: Optional[str] = None,
         master_key: Optional[str] = None,
+        cfg_dword: Optional[int] = None,
     ):
         self.db_dir = db_dir or auto_detect_db_dir()
         if not self.db_dir:
@@ -515,6 +516,7 @@ class WeChatDB:
         self.keys_file = keys_file or os.path.join(self.workdir, "keys.json")
         self._keys: Dict[str, bytes] = {}
         self._db_files = self._collect_db_files()
+        self._cfg_dword_input = cfg_dword
         self.master_key: Optional[str] = None
         self.cfg_dword: Optional[int] = None
         self._load_or_extract_keys(master_key=master_key)
@@ -678,11 +680,15 @@ class WeChatDB:
         if master_key:
             self._keys.update(self.derive_keys_from_master(master_key))
             self.master_key = master_key
-            self.cfg_dword = None
+            self.cfg_dword = (self._cfg_dword_input
+                              if self._cfg_dword_input is not None
+                              else self._load_cfg_dword_from_cache())
             self._save_keys()
         else:
             self.master_key = None
-            self.cfg_dword = None
+            self.cfg_dword = (self._cfg_dword_input
+                              if self._cfg_dword_input is not None
+                              else self._load_cfg_dword_from_cache())
             
             # 优先级1: 尝试已保存的密钥——多位置合并（稳定副本 > 工作缓存 > .bak >
             # 其它账号缓存），全部经页1 HMAC 校验，只保留真能用的
@@ -1236,6 +1242,30 @@ class WeChatDB:
             pass
         return out
 
+    def _load_cfg_dword_from_cache(self) -> Optional[int]:
+        """从 keys.json 缓存恢复 cfgDword（图片密钥派生源）。
+
+        cfgDword 与主密钥来自同一次进程内存读取，随 keys.json 一并持久化后，
+        走 master_key 分支或缓存分支即可离线派生图片密钥，无需再读内存。
+        """
+        paths = []
+        sf = self._stable_key_file()
+        if sf:
+            paths.append(sf)
+        paths += [self.keys_file, self.keys_file + ".bak"]
+        for cp in paths:
+            if not os.path.exists(cp):
+                continue
+            try:
+                with open(cp, encoding="utf-8") as f:
+                    data = json.load(f)
+            except (OSError, json.JSONDecodeError):
+                continue
+            v = data.get("@cfg_dword")
+            if isinstance(v, int):
+                return v
+        return None
+
     def _save_keys(self) -> None:
         """写密钥缓存。
 
@@ -1247,6 +1277,8 @@ class WeChatDB:
         if not self._keys:
             return
         data = {k: v.hex() for k, v in self._keys.items()}
+        if self.cfg_dword is not None:
+            data["@cfg_dword"] = self.cfg_dword
         try:
             os.makedirs(os.path.dirname(self.keys_file), exist_ok=True)
             tmp = self.keys_file + ".tmp"
